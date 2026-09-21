@@ -179,7 +179,7 @@ class Vision:
 
             west = i + i // Constants.VISION_SIZE
             horizontal, vertical = self._horizontal_edges, self._vertical_edges
-            tile = self._tiles[i] = Tile(position, entity, int(pearl_time), bool(has_pearl), (
+            tile = self._tiles[i] = Tile(position, entity, int(pearl_time), bool(int(has_pearl)), (
                 horizontal[i], vertical[west + 1], horizontal[i + Constants.VISION_SIZE], vertical[west]))
         return tile
 
