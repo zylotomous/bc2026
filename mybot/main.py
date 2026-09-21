@@ -1,6 +1,7 @@
 import helper as unswbc
 from helper import Direction, EdgeType
 import random
+from collections import deque
 
 ct: unswbc.Controller
 game: unswbc.Game
@@ -14,6 +15,86 @@ drift_direction = None
 
 # Seed so we get the same random generator every time.
 random.seed(0)
+
+def _bfs_next_step(target):
+    """Find the first step of a shortest path to target within vision,
+    treating kelp and other dragons' bodies as obstacles. Returns a
+    Direction, or None if target is unreachable within the visible
+    window."""
+    here = ct.get_position()
+    if target is None or here == target:
+        return None
+
+    visited = {here}
+    queue = deque()
+
+    here_tile = ct.get_tile(here)
+    for direction in Direction.get_direction_list():
+        if here_tile.get_edge(direction).get_edge_type() == EdgeType.KELP:
+            continue
+        nxt = here.add_dir(direction)
+        nxt_tile = ct.get_tile(nxt)
+        if nxt_tile is None:
+            continue
+        occupant = nxt_tile.get_dragon()
+        if occupant is not None and nxt != target:
+            continue
+        if nxt in visited:
+            continue
+        visited.add(nxt)
+        if nxt == target:
+            return direction
+        queue.append((nxt, direction))
+
+    while queue:
+        pos, first_dir = queue.popleft()
+        tile = ct.get_tile(pos)
+        if tile is None:
+            continue
+        for direction in Direction.get_direction_list():
+            if tile.get_edge(direction).get_edge_type() == EdgeType.KELP:
+                continue
+            nxt = pos.add_dir(direction)
+            if nxt in visited:
+                continue
+            nxt_tile = ct.get_tile(nxt)
+            if nxt_tile is None:
+                continue
+            occupant = nxt_tile.get_dragon()
+            if occupant is not None and nxt != target:
+                continue
+            visited.add(nxt)
+            if nxt == target:
+                return first_dir
+            queue.append((nxt, first_dir))
+
+    return None
+
+def _safest_fallback():
+    """When no target-driven candidate exists, pick any direction that
+    isn't kelp and isn't occupied. This is the last resort and must
+    never skip safety checks."""
+    here = ct.get_position()
+    here_tile = ct.get_tile(here)
+    for direction in Direction.get_direction_list():
+        if here_tile.get_edge(direction).get_edge_type() == EdgeType.KELP:
+            continue
+        ahead = ct.get_tile(here.add_dir(direction))
+        if ahead is not None and ahead.get_dragon() is not None:
+            continue
+        return direction
+    return Direction.NORTH  # truly no safe option; death is unavoidable
+
+
+def _is_trapped(here, here_tile):
+    """True if every direction is blocked by kelp or an occupied tile."""
+    for direction in Direction.get_direction_list():
+        if here_tile.get_edge(direction).get_edge_type() == EdgeType.KELP:
+            continue
+        ahead = ct.get_tile(here.add_dir(direction))
+        if ahead is not None and ahead.get_dragon() is None:
+            return False
+    return True
 
 def _distance(first: unswbc.Position, second: unswbc.Position) -> int:
     """Return the shortest wrapped distance between two positions."""
@@ -78,7 +159,6 @@ def _visible_enemy(dragon_id: int, enemy_id: int | None):
 
     return found_id, target
 
-
 def execute_turn() -> None:
     """Apply the dragon's role rules, then seek its current target."""
     global is_queen, pearls_eaten, previous_length, next_queen_split
@@ -93,7 +173,7 @@ def execute_turn() -> None:
 
     if is_queen:
         can_split = (
-            ct.get_length() >= 5
+            ct.get_length() >= 4
             and pearls_eaten >= next_queen_split
             and ct.can_split(2)
         )
@@ -107,7 +187,6 @@ def execute_turn() -> None:
         return
 
     dragon_id = ct.get_id()
-
     here = ct.get_position()
     here_tile = ct.get_tile(here)
 
@@ -120,6 +199,34 @@ def execute_turn() -> None:
             target = enemy_target
         else:
             tracked_enemy_id = None
+
+    # Try BFS pathfinding to the target first.
+    if target is not None:
+        step = _bfs_next_step(target)
+        if step is not None:
+            # For an enemy-head target, make sure the step is actually
+            # legal (BFS treats the target tile as passable even though
+            # it holds a dragon, which is fine only when it's the head
+            # we're deliberately colliding with).
+            if target_type == "dragon":
+                ahead = ct.get_tile(here.add_dir(step))
+                ahead_dragon = ahead.get_dragon() if ahead else None
+                is_target_head = (
+                    ahead_dragon is not None
+                    and ahead.get_position() == target
+                    and ahead_dragon.get_team() != ct.get_team()
+                    and ahead_dragon.get_id() == tracked_enemy_id
+                    and ahead_dragon.is_head()
+                )
+                if ahead_dragon is not None and not is_target_head:
+                    step = None
+            if step is not None:
+                ct.make_move(step)
+                return
+
+    # BFS found nothing usable (no target, target out of vision, or
+    # unreachable). Fall back to the old greedy scan, which also
+    # handles the "drift in a straight line" wandering behaviour.
     directions = Direction.get_direction_list()
     random.shuffle(directions)
     candidates = []
@@ -159,7 +266,13 @@ def execute_turn() -> None:
         ct.make_move(direction)
         return
 
-    ct.make_move(Direction.NORTH)
+    if _is_trapped(here, here_tile):
+        max_child = ct.get_length() - 2
+        if max_child >= 2 and ct.can_split(max_child):
+            ct.do_split(max_child)
+            return
+
+    ct.make_move(_safest_fallback())
 
 def main() -> None:
     global ct, game, is_queen, previous_length, drift_direction
