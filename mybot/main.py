@@ -915,7 +915,7 @@ def execute_turn() -> None:
             after = ([nb] + body) if nb in pearls else ([nb] + body[:-1])
             aligned_next = split_ready(after, i)
         # while exploring, prefer stepping onto ground we have not just walked
-        fresh = not (exploring and walked_recently(nb, now))
+        fresh = not (exploring and walked_recently(nb * 2, now))
         return (min(exits_from(nb)[1], 2), toward_target, fresh, aligned_next, i == heading, random.random())
 
     move = max(options, key=rank)
