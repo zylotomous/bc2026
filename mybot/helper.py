@@ -9,6 +9,7 @@ UINT32_MIN = 0
 UINT32_MAX = (1 << INT_SIZE) - 1
 
 class Constants:
+    """What the engine is fixed at: 500 rounds, a 7x7 window, length 3 at spawn, length 2 minimum."""
     MAX_ROUNDS: int = 500
     VISION_RADIUS: int = 3
     VISION_SIZE: int = 2 * VISION_RADIUS + 1
@@ -20,6 +21,7 @@ _OFFSET_BY_VALUE = {"N": (0, -1), "E": (1, 0), "S": (0, 1), "W": (-1, 0)}
 _INDEX_BY_VALUE = {"N": 0, "E": 1, "S": 2, "W": 3}
 
 class Direction(Enum):
+    """One of the four compass directions. North is up, and y grows downwards."""
     NORTH = "N"
     EAST = "E"
     SOUTH = "S"
@@ -31,22 +33,28 @@ class Direction(Enum):
         self._index: int = _INDEX_BY_VALUE[value]
     @property
     def value(self) -> str:
+        """The protocol letter, N, E, S or W."""
         return self._value_
 
     @classmethod
     def get_direction_list(cls) -> list["Direction"]:
+        """A fresh list of all four, north, east, south, west."""
         return _DIRECTIONS[::]
         
     def get_offset(self) -> tuple[int, int]:
+        """The (dx, dy) of one step this way, with y growing downwards."""
         return self._offset
 
     def get_opposite(self) -> "Direction":
+        """The reverse direction."""
         return _OPPOSITE[self]
 
     def get_left(self) -> "Direction":
+        """A quarter turn anticlockwise."""
         return _LEFT[self]
 
     def get_right(self) -> "Direction":
+        """A quarter turn clockwise."""
         return _RIGHT[self]
 
 _DIRECTIONS = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
@@ -56,15 +64,18 @@ _LEFT = {d: _DIRECTIONS[(i + 3) % 4] for i, d in enumerate(_DIRECTIONS)}
 _RIGHT = {d: _DIRECTIONS[(i + 1) % 4] for i, d in enumerate(_DIRECTIONS)}
 
 class Team(Enum):
+    """Which side a dragon plays for."""
     A = "A"
     B = "B"
 
     def get_enemy_team(self) -> "Team":
+        """The other team."""
         return Team.A if self == Team.B else Team.B
 
 _TEAM_BY_VALUE = {"A": Team.A, "B": Team.B}
 
 class Position:
+    """A tile's x and y, with (0, 0) at the top left and y growing downwards."""
     __slots__ = ("x", "y")
 
     def __init__(self, x: int, y: int):
@@ -83,6 +94,7 @@ class Position:
         return f"Position({self.x}, {self.y})"
 
     def add_dir(self, direction: Direction) -> "Position":
+        """The position one step that way, wrapped around the map edges."""
         active_game = game
         if active_game is None:
             raise RuntimeError("init() must be called before using wrapped positions")
@@ -91,9 +103,11 @@ class Position:
                         (self.y + dy) % active_game.height)
 
     def is_in_map(self):
+        """Whether these coordinates are on the board, which only matters for ones you worked out yourself."""
         return self.x >= 0 and self.y >= 0 and self.x < game.width and self.y < game.height
     
     def is_in_vision(self):
+        """Whether this tile is inside your 7x7 window this turn."""
         if game is None:
             raise RuntimeError("init() must be called before checking vision")
         width, height = game.width, game.height
@@ -110,6 +124,7 @@ class Position:
         return True
 
 class Game:
+    """The board and the round number, which every dragon sees the same way."""
     round_num: int = 0
     width: int = 0
     height: int = 0
@@ -122,17 +137,19 @@ class Game:
         self.unit_limit = unit_limit
 
     def get_round_num(self) -> int:
+        """The round being played; the game ends after 500 of them."""
         return self.round_num
 
     def get_map_size(self) -> tuple[int, int]:
+        """The map's (width, height) in tiles."""
         return self.width, self.height
 
     def get_unit_limit(self) -> int:
+        """The most dragons one team may have alive at once, which is what caps splitting."""
         return self.unit_limit
 
 class Vision:
-    """The tiles around the head. update() only stores the round's lines,
-    and a tile is parsed the first time it is asked for."""
+    """The 7x7 block of tiles around your head, parsed as you ask for it."""
     __slots__ = ("_tile_lines", "_body_lines", "_edge_lines", "_head", "_game",
                  "_left", "_top", "_tiles", "_dragon_parts", "_horizontal_edges", "_vertical_edges")
 
@@ -150,12 +167,14 @@ class Vision:
         self._dragon_parts: dict[tuple[int, int], "DragonPart"] = None
 
     def get_tiles(self) -> list["Tile"]:
+        """All 49 tiles, row by row from the top left."""
         if None in self._tiles:
             for i in range(len(self._tiles)):
                 self._tile(i)
         return self._tiles[::]
 
     def get_tile(self, pos: Position) -> "Tile | None":
+        """The tile at pos, or None if pos is outside the window."""
         if not self._tiles:
             return None
         width, height = self._game.width, self._game.height
@@ -179,7 +198,7 @@ class Vision:
 
             west = i + i // Constants.VISION_SIZE
             horizontal, vertical = self._horizontal_edges, self._vertical_edges
-            tile = self._tiles[i] = Tile(position, entity, int(pearl_time), bool(int(has_pearl)), (
+            tile = self._tiles[i] = Tile(position, entity, int(pearl_time), has_pearl == "1", (
                 horizontal[i], vertical[west + 1], horizontal[i + Constants.VISION_SIZE], vertical[west]))
         return tile
 
@@ -203,6 +222,7 @@ class Vision:
         self._vertical_edges = [_VERTICAL_EDGES[text] for text in vertical]
 
 class Tile:
+    """One square of the board, with whatever stands on it and its four edges."""
     __slots__ = ("position", "dragon_part", "pearl_time", "pearl", "_edges", "_edges_by_direction")
 
     def __init__(self, position: Position, dragon_part: "DragonPart", pearl_time: int, has_pearl: bool,
@@ -217,26 +237,33 @@ class Tile:
 
     @property
     def edges(self) -> dict[Direction, "Edge"]:
+        """The four edges keyed by direction."""
         if self._edges_by_direction is None:
             self._edges_by_direction = dict(zip(_DIRECTIONS, self._edges))
         return self._edges_by_direction
 
     def get_edge(self, direction: Direction) -> "Edge":
+        """The edge you would cross stepping that way."""
         return self._edges[direction._index]
 
     def get_dragon(self) -> "DragonPart | None":
+        """The dragon segment standing here, or None if the tile is clear."""
         return self.dragon_part
 
     def has_pearl(self) -> bool:
+        """Whether a pearl is on this tile right now."""
         return self.pearl
         
     def get_pearl_time(self) -> int:
+        """Rounds until this tile next tries to spawn a pearl, or -1 if it never does."""
         return self.pearl_time
 
     def get_position(self) -> Position:
+        """This tile's position on the board."""
         return self.position
 
 class DragonPart:
+    """One segment of a dragon, head or body."""
     __slots__ = ("position", "dragon_id", "team", "dir", "is_dragon_head")
 
     def __init__(self, position: Position, dragon_id: int, team: Team,
@@ -251,26 +278,34 @@ class DragonPart:
         return f"DragonPart(id={self.dragon_id}, dir={self.dir})"
 
     def get_position(self) -> Position:
+        """Where this segment is."""
         return self.position
 
     def get_id(self) -> int:
+        """The dragon this segment belongs to."""
         return self.dragon_id
 
     def get_team(self) -> Team:
+        """The team that dragon plays for."""
         return self.team
 
     def get_dir(self) -> Direction:
+        """The direction this segment faces.
+        A head faces where it is heading, and a body segment faces towards the head."""
         return self.dir
 
     def is_head(self) -> bool:
+        """Whether this is the head; stepping into another dragon's head kills both of you."""
         return self.is_dragon_head
 
 class EdgeType(Enum):
+    """What lies between two tiles: EMPTY, KELP or PORTAL."""
     EMPTY = 0
     KELP = 1
     PORTAL = 2
 
 class Edge:
+    """The boundary between two tiles."""
     __slots__ = ("is_horizontal", "edge_type", "portal_id")
 
     def __init__(self, is_horizontal: bool, edge_type: EdgeType, portal_id: int = -1):
@@ -278,11 +313,20 @@ class Edge:
         self.edge_type = edge_type
         self.portal_id = portal_id
 
+    def is_passable(self) -> bool:
+        """Whether a dragon can cross this edge; kelp is the only thing that stops one."""
+        return self.edge_type != EdgeType.KELP
+
+    def is_portal(self) -> bool:
+        """Whether crossing this edge comes out at its partner edge."""
+        return self.edge_type == EdgeType.PORTAL
+
     def get_edge_type(self) -> EdgeType:
+        """Whether this edge is EMPTY, KELP or PORTAL."""
         return self.edge_type
 
-    # returns portal id if portal, else -1
     def get_portal_id(self) -> int:
+        """The id this portal shares with its far edge, or -1 if this edge is not a portal."""
         return self.portal_id
 
 class _Edges(dict):
@@ -302,6 +346,7 @@ _HORIZONTAL_EDGES = _Edges(True)
 _VERTICAL_EDGES = _Edges(False)
 
 class Controller:
+    """Your dragon: what it sees, how long it is, and the commands it sends this turn."""
     length: int = 0
     unit_count: int = 0
     unit_limit: int = 0
@@ -318,66 +363,89 @@ class Controller:
         self.sonar_messages = list(sonar_messages) if sonar_messages is not None else []
 
     def get_length(self) -> int:
+        """Segments your dragon has, counting the head."""
         return self.length
 
     def get_unit_count(self) -> int:
+        """Dragons your team has alive, this one included."""
         return self.unit_count
 
     def get_head(self) -> DragonPart:
+        """Your dragon's head segment."""
         return self.head
 
     def get_id(self) -> int:
+        """Your dragon's id, which is also its place in the turn order."""
         return self.head.dragon_id
 
     def get_team(self) -> Team:
+        """The team you play for."""
         return self.head.team
 
     def get_dir(self) -> Direction:
+        """The way your head points at the start of this turn."""
         return self.head.dir
 
     def get_vision(self) -> Vision:
+        """The tiles around your head."""
         return self.vision
 
     def get_tiles(self) -> list[Tile]:
+        """All 49 tiles in view, row by row from the top left."""
         return self.vision.get_tiles()
 
     def get_tile(self, pos: Position) -> "Tile | None":
+        """The tile at pos, or None if pos is outside the window."""
         return self.vision.get_tile(pos)
 
     def get_position(self) -> Position:
+        """Your head's position, already wrapped into the map."""
         return self.head.position
 
     def make_move(self, direction: Direction):
+        """Steps one tile that way; of everything you send, the last action is the one applied."""
         print(f"MOVE {direction.value}")
 
     def make_moves(self, directions: list[Direction]):
+        """Sprints one step per direction in the list.
+        The helper sends whatever you pass, and n steps cost n - 1 segments, so your dragon must be longer than n."""
         moves = "".join(direction.value for direction in directions)
         print(f"MOVE {moves}")
 
     def can_split(self, child_size: int) -> bool:
+        """Whether a child of that many segments is legal this turn."""
         return (Constants.MIN_SIZE <= child_size
                 and self.length - child_size >= Constants.MIN_SIZE
                 and self.unit_count < self.unit_limit)
 
     def do_split(self, child_size: int):
+        """Splits that many segments off your tail.
+        The child is those segments reversed, and it takes its own turn later in the same round."""
         print(f"SPLIT {child_size}")
 
     def output_log(self, *message):
-        print(f"LOG ", *message)
+        """Prints a line that shows against this turn in the replay.
+        Every line costs points, so keep logging light: see the Timeouts page."""
+        print("LOG", *message)
 
     def draw_indicator_dot(self, pos: Position, r: int, g: int, b: int):
+        """Draws a dot on the replay's board, which changes nothing in the game."""
         print(f"DOT {pos.x} {pos.y} {r} {g} {b}")
 
     def draw_indicator_line(self, start: Position, end: Position, r: int, g: int, b: int):
+        """Draws a line on the replay's board."""
         print(f"LINE {start.x} {start.y} {end.x} {end.y} {r} {g} {b}")
 
     def set_indicator_string(self, message: str):
+        """Labels your dragon with this text for the turn."""
         print(f"INDICATOR {message}")
 
     def get_sonar_messages(self) -> list[int]:
+        """Values that reached you since your last turn, in the order they were sent."""
         return self.sonar_messages[::]
 
     def send_sonar(self, message: int) -> bool:
+        """Sends a value along your facing once this turn's action is done, and returns False if it is not an unsigned 32-bit integer."""
         if not _is_uint32(message):
             return False
         print(f"SONAR {message}")
@@ -387,8 +455,8 @@ def _is_uint32(value: object) -> bool:
     return (isinstance(value, int) and not isinstance(value, bool)
             and UINT32_MIN <= value <= UINT32_MAX)
 
-# Read initial data from stdin, initialize game/controller
 def init() -> tuple[Controller, Game]:
+    """Reads the spawn block and returns your (controller, game), which stay valid all match."""
     global ct, game
 
     read = sys.stdin.readline
@@ -403,8 +471,8 @@ def init() -> tuple[Controller, Game]:
 
     return controller, game
 
-# Read turn data from stdin, update game/controller
 def update(controller: Controller, game_state: Game) -> bool:
+    """Reads the next turn into the controller, and returns False once the game is over or your dragon has died."""
     read = sys.stdin.readline
 
     # judge ends each round input w blank line
@@ -441,4 +509,5 @@ def update(controller: Controller, game_state: Game) -> bool:
     return True
 
 def end_turn():
+    """Ends the turn and flushes everything you printed."""
     print("ENDTURN", flush=True)
