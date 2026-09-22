@@ -835,7 +835,7 @@ def execute_turn() -> None:
         if split_ok:
             fleeing = safe and threatened(mp, enemies) and not in_trouble
             if not fleeing:
-                ct.do_split(split_size)
+                if not (is_queen and now > QUEEN_RANDOM_SPLIT_LAST_ROUND): ct.do_split(split_size)
                 return
     else:
         can_split = can_split_basic and ct.can_split(SPLIT_SIZE)
