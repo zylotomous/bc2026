@@ -56,6 +56,7 @@ QUEEN_MIN_SPLIT_LENGTH = 0.12   # queens only split once they're at least this l
     # split length should depend on the round, this will become a arb constant of min split length per round
     # i.e., split length per round
 QUEEN_SPLIT_FRACTION = 3      # queens split off roughly 1/this of their length
+QUEEN_PROMOTE_FINAL_ROUND = 200 # round at which everything becomes queen
 
 # --- map-size-aware splitting tuning ---
 SMALL_MAP_THRESHOLD = 25            # width and/or height at or below this counts as "small"
@@ -708,7 +709,7 @@ def execute_turn() -> None:
 
     if not is_queen:
         promote_chance = QUEEN_PROMOTE_RATE if now > QUEEN_PROMOTE_START_ROUND else 0.0
-        if random.random() < promote_chance:
+        if random.random() < promote_chance or now > QUEEN_PROMOTE_FINAL_ROUND:
             is_queen = True
             is_killer = False
         elif not is_killer and random.random() < KILLER_BASE_RATE:
@@ -945,7 +946,7 @@ def main() -> None:
     W, H = game.get_map_size()
     is_small_map = W <= SMALL_MAP_THRESHOLD or H <= SMALL_MAP_THRESHOLD
     random.seed(ct.get_id())
-    is_queen = ct.get_id() == 0
+    is_queen = ct.get_id() == 0 or ct.get_id() == 1
     is_killer = False
 
     while unswbc.update(ct, game):
