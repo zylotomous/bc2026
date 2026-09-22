@@ -1,7 +1,6 @@
 import helper as unswbc
 from helper import Direction
 import random
-import time
 from collections import deque
 
 ct: unswbc.Controller
@@ -18,45 +17,19 @@ SPLIT_SIZE = 2          # default split-off size for non-queens
 REQUIRE_OPPOSITE_HEADS = True   # only split when parent and child would face opposite ways;
                                 # False splits the moment a split is legal
 SEARCH_DEPTH = 24       # how far (in steps) we plan through remembered tiles
-RIVAL_DEPTH = 12        # how far we look when guessing where other dragons are heading
-MAX_RIVALS = 3
+RIVAL_DEPTH = 16        # how far we look when guessing where other dragons are heading
+MAX_RIVALS = 5
 MAX_TARGETS = 12
 PLAN_DEPTH = 5          # how many moves ahead we look for a way to line up a split
 SPAWN_HORIZON = 40      # only walk towards a not-yet-spawned pearl if it appears this soon
 STALE_AFTER = 80        # rounds until a remembered tile counts as fully "unexplored" again
 DEBUG = False
 
-# --- per-turn CPU budget ---
-# The judge gives a turn 100M CPU points and kills a dragon that overspends ("no valid action").
-# In its sandbox one point is one nanosecond of perf_counter(), so 0.1s is the hard limit. A turn
-# also spends ~15M points before execute_turn starts and a little after the last check, so the
-# budgets below (measured from the start of execute_turn) leave a margin. Natively perf_counter is
-# real time and a turn takes a few ms, so these never fire there.
-SOFT_BUDGET_S = 0.045   # past this, drop the optional extras (rival bids, split steering, deep escape search)
-HARD_BUDGET_S = 0.065   # past this, stop planning and take a cheap safe move
-turn_t0 = 0.0
-
-# --- staying off the map border, and off ground we have just walked (every map size) ---
-CENTER_BIAS = 10.0      # cost (in turns) of a goal on the very edge versus dead centre
-BORDER_MARGIN = 3       # goals this close to the map border get an extra penalty
-BORDER_PENALTY = 5.0    # extra cost for a goal right on the border, fading to 0 at BORDER_MARGIN
-RETRACE_MEMORY = 60     # rounds a tile we stood on still counts as "already walked"
-RETRACE_PENALTY = 8.0   # cost for an exploration goal on ground we walked over just now
-PEARL_EDGE_WEIGHT = 0.25    # share of that edge cost charged to a pearl that is already there ...
-SPAWN_EDGE_WEIGHT = 0.6     # ... and to a tile we would only be waiting at for a pearl to appear
-EDGE_STREAK_RAMP = 10   # every this many turns spent hugging the border adds 1x to the edge costs ...
-EDGE_STREAK_CAP = 30    # ... up to this many turns' worth
-
 # --- role/queen tuning ---
-QUEEN_PROMOTE_START_ROUND = 150   # no queen promotions at all up to and including this round
-QUEEN_PROMOTE_RATE = 0.005        # after that, the flat per-turn promotion chance for a non-queen
-QUEEN_RANDOM_SPLIT_RATE = 0.05    # per-turn chance a queen sheds a minimum-size child whenever it legally can
-QUEEN_RANDOM_SPLIT_LAST_ROUND = 400   # ...but never after this round
-QUEEN_MIN_SPLIT_LENGTH = 0.12   # queens only split once they're at least this long
-    # split length should depend on the round, this will become a arb constant of min split length per round
-    # i.e., split length per round
+QUEEN_BASE_RATE = 0.10        # base per-turn promotion chance for a non-queen
+QUEEN_COMBAT_BONUS = 0.05     # extra promotion chance added per survived threat
+QUEEN_MIN_SPLIT_LENGTH = 12   # queens only split once they're at least this long
 QUEEN_SPLIT_FRACTION = 3      # queens split off roughly 1/this of their length
-QUEEN_PROMOTE_FINAL_ROUND = 200 # round at which everything becomes queen
 
 # --- map-size-aware splitting tuning ---
 SMALL_MAP_THRESHOLD = 25            # width and/or height at or below this counts as "small"
@@ -71,11 +44,7 @@ edges: dict = {}        # (x, y) -> (north, east, south, west) edge types as int
 last_seen: dict = {}    # (x, y) -> round we last had it in view
 pearls: set = set()     # tiles we believe hold a pearl right now
 spawn_at: dict = {}     # (x, y) -> round a pearl is expected to appear
-portal_id_at: dict = {} # ((x, y), side) -> id of the portal on that side of the tile
-portal_ends: dict = {}  # portal id -> the physical edges (see edge_key) we have seen carrying it
 hist: list = []         # our head's positions, oldest first; the body is its tail end
-visit_round: dict = {}  # (x, y) -> last round our head stood there, so exploration can avoid retracing
-edge_streak = 0         # turns in a row our head has been within BORDER_MARGIN of the map border
 prev_target = None      # the tile we were heading for last turn; sticking to it stops dithering
 STICKY_BONUS = 3        # turns' worth of head start the current target gets over a fresh one
 
@@ -90,82 +59,12 @@ def step(pos, i):
     return ((pos[0] + DX[i]) % W, (pos[1] + DY[i]) % H)
 
 
-NBR: dict = {}          # (x, y) -> its four wrapped neighbours (N, E, S, W), filled in as tiles are met
-
-
-def nbrs(pos):
-    """The four neighbours of pos, cached: the searches visit the same tiles every turn."""
-    r = NBR.get(pos)
-    if r is None:
-        x, y = pos
-        r = NBR[pos] = ((x, (y - 1) % H), ((x + 1) % W, y), (x, (y + 1) % H), ((x - 1) % W, y))
-    return r
-
-
-def spent():
-    """Seconds spent on this turn so far (CPU points / 1e9 in the judge's sandbox)."""
-    return time.perf_counter() - turn_t0
-
-
 def dir_between(a, b):
     """Index of the direction that takes a to the adjacent tile b, or None."""
     for i in range(4):
         if step(a, i) == b:
             return i
     return None
-
-
-def edge_key(tile, side):
-    """Name of the physical edge on `side` of `tile`: the same for the tile on either side of it.
-    ('H', x, y) lies between (x, y-1) and (x, y); ('V', x, y) between (x-1, y) and (x, y)."""
-    x, y = tile
-    if side == 0:
-        return ('H', x, y)
-    if side == 2:
-        return ('H', x, (y + 1) % H)
-    if side == 3:
-        return ('V', x, y)
-    return ('V', (x + 1) % W, y)
-
-
-def portal_exit(tile, side):
-    """Where a head lands after stepping from `tile` through the portal on `side`: the tile just
-    beyond the partner edge in the direction of travel. None while we have not seen the partner."""
-    pid = portal_id_at.get((tile, side))
-    if pid is None:
-        return None
-    here = edge_key(tile, side)
-    for kind, x, y in portal_ends.get(pid, ()):
-        if (kind, x, y) == here:
-            continue
-        if kind == 'H':
-            if side == 2:
-                return (x, y)
-            if side == 0:
-                return (x, (y - 1) % H)
-        elif side == 1:
-            return (x, y)
-        elif side == 3:
-            return ((x - 1) % W, y)
-        return (x, y)       # partner runs across our line of travel: it lets us out on the tile it belongs to
-    return None
-
-
-def portal_moves(mp, heading, occupied, enemies, own):
-    """Sides of our head that lead through a portal onto a tile we cannot see to be taken.
-    A partner edge we have never seen leaves the landing tile unknown; that still counts.
-    `own` is our body as best we know it: a portal just behind us leads straight back into it
-    (the neck is on the far side, usually out of view), so reversing is never an option."""
-    found = []
-    for i in range(4):
-        if edges[mp][i] != 2 or i == OPP[heading]:
-            continue
-        dest = portal_exit(mp, i)
-        if dest is not None and (dest in occupied or dest in own or threatened(dest, enemies)):
-            continue
-        found.append(i)
-    found.sort(key=lambda i: portal_exit(mp, i) is None)   # portals whose far side we know come first
-    return found
 
 
 def wrap_dist(a, b):
@@ -186,13 +85,7 @@ def observe(now):
     for tile in ct.get_tiles():
         p = tile.get_position()
         key = (p.x, p.y)
-        if key not in edges:    # kelp and portals never change, so each tile is read once
-            sides = [tile.get_edge(d) for d in DIRS]
-            edges[key] = tuple(s.get_edge_type().value for s in sides)
-            for i, s in enumerate(sides):
-                if s.is_portal():
-                    portal_id_at[key, i] = s.get_portal_id()
-                    portal_ends.setdefault(s.get_portal_id(), set()).add(edge_key(key, i))
+        edges[key] = tuple(tile.get_edge(d).get_edge_type().value for d in DIRS)
         last_seen[key] = now
 
         if tile.has_pearl():
@@ -273,22 +166,17 @@ def my_search(mp, allowed, blocked):
         dist[nb] = 1
         mask[nb] = 1 << i
         q.append(nb)
-    popped = 0
     while q:
-        popped += 1
-        if not popped & 127 and spent() > SOFT_BUDGET_S:
-            break       # out of time: what is found so far is exact, the far tiles are simply unknown
         cur = q.popleft()
         d = dist[cur]
         if d >= SEARCH_DEPTH:
             continue
         e = edges[cur]
         m = mask[cur]
-        around = nbrs(cur)
         for i in range(4):
             if e[i]:
                 continue
-            nb = around[i]
+            nb = step(cur, i)
             if nb == mp or nb in blocked or nb not in edges:
                 continue
             nd = dist.get(nb)
@@ -301,11 +189,8 @@ def my_search(mp, allowed, blocked):
     return dist, mask
 
 
-def plain_search(start, depth, targets=None):
-    """Distances from start through remembered tiles, out to `depth`. With `targets` given, stops as
-    soon as every one of them has been reached (the distances found so far are already exact)."""
+def plain_search(start, depth):
     dist = {start: 0}
-    remaining = set(targets) if targets else None
     q = deque([start])
     while q:
         cur = q.popleft()
@@ -315,17 +200,12 @@ def plain_search(start, depth, targets=None):
         e = edges.get(cur)
         if e is None:
             continue
-        around = nbrs(cur)
         for i in range(4):
             if e[i]:
                 continue
-            nb = around[i]
+            nb = step(cur, i)
             if nb not in dist and nb in edges:
                 dist[nb] = d + 1
-                if remaining is not None:
-                    remaining.discard(nb)
-                    if not remaining:
-                        return dist
                 q.append(nb)
     return dist
 
@@ -365,9 +245,6 @@ def escape_depth(nb, body, others_block, need, budget=500):
         used += 1
         if used > budget:
             return False                    # out of patience: report what we found so far
-        if not used & 31 and spent() > HARD_BUDGET_S:
-            used = budget + 1               # out of time: same, and unwind the whole search
-            return False
         e = edges.get(cur)
         if e is None:
             best = need                     # beyond what we have mapped: assume open water
@@ -403,15 +280,11 @@ def assign_target(now, my_dist, rivals):
     Every visible dragon head, friend or foe, bids for the candidates with the number of turns it
     needs; bids are settled cheapest first, lowest dragon id winning ties (lower ids move first).
     Returns (tile, rival_distance_to_it) or (None, None) if nothing is ours."""
-    # Every candidate carries a penalty (in turns) that rivals are charged as well: for pearls that
-    # are not there yet, the uncertainty; for any of them, a share of the cost of standing on the
-    # map border, where dragons otherwise end up circling the empty lanes.
     cands = []
     for p in pearls:
         d = my_dist.get(p)
         if d:
-            pen = PEARL_EDGE_WEIGHT * edge_cost(p)
-            cands.append((d + pen, p, 0, pen))
+            cands.append((d, p, 0, 0))
     for p, s in spawn_at.items():
         if p in pearls:
             continue
@@ -421,12 +294,11 @@ def assign_target(now, my_dist, rivals):
         wait = s - now
         if wait > SPAWN_HORIZON:
             continue
-        edge = SPAWN_EDGE_WEIGHT * edge_cost(p)
         if wait <= 0:
             # overdue: a pearl has very likely appeared since we last looked
-            cands.append((d + 4 + edge, p, 0, 4 + edge))
+            cands.append((d + 4, p, 0, 4))
         else:
-            cands.append((max(d, wait) + 3 + edge, p, wait, 3 + edge))
+            cands.append((max(d, wait) + 3, p, wait, 3))
     if not cands:
         return None, None
     cands.sort(key=lambda c: c[0])
@@ -438,11 +310,8 @@ def assign_target(now, my_dist, rivals):
     bids = [(c[0] - (STICKY_BONUS if c[1] == prev_target else 0), ct.get_id(), -1, ci)
             for ci, c in enumerate(cands)]
     rival_dist = [dict() for _ in rivals]
-    goals = {c[1] for c in cands}
     for ri, (rid, rpos) in enumerate(rivals):
-        if spent() > SOFT_BUDGET_S:
-            break   # out of time: bid without the remaining rivals rather than risk the turn
-        rd = plain_search(rpos, RIVAL_DEPTH, goals)
+        rd = plain_search(rpos, RIVAL_DEPTH)
         for ci, (_, p, wait, pen) in enumerate(cands):
             dd = rd.get(p)
             if dd is not None:
@@ -462,52 +331,11 @@ def assign_target(now, my_dist, rivals):
     return None, None
 
 
-def border_dist(t):
-    """How many tiles t is from the nearest raw edge of the map."""
-    return min(t[0], W - 1 - t[0], t[1], H - 1 - t[1])
-
-
-def edge_cost(t):
-    """Cost of a goal at t: rises towards the border, with an extra step up within BORDER_MARGIN of
-    it, and scaled up the longer we have been hugging the border. The map wraps, but its raw
-    border is where the long empty lanes are, and they keep dragons running in circles."""
-    x, y = t
-    off = max(abs(x - (W - 1) / 2) / (W / 2), abs(y - (H - 1) / 2) / (H / 2))   # 0 centre .. ~1 border
-    cost = CENTER_BIAS * off
-    border = border_dist(t)
-    if border < BORDER_MARGIN:
-        cost += BORDER_PENALTY * (BORDER_MARGIN - border) / BORDER_MARGIN
-    return cost * (1 + min(edge_streak, EDGE_STREAK_CAP) / EDGE_STREAK_RAMP)
-
-
-def walked_recently(t, now):
-    """Did our head stand on t within the last RETRACE_MEMORY rounds?"""
-    seen = visit_round.get(t)
-    return seen is not None and now - seen < RETRACE_MEMORY
-
-
-def retrace_cost(t, now):
-    """Cost of an exploration goal on (or next to) ground we have already walked, fading with age."""
-    cost = 0.0
-    n, e, s, w = nbrs(t)
-    for k, weight in ((t, 1.0), (n, 0.3), (e, 0.3), (s, 0.3), (w, 0.3)):
-        seen = visit_round.get(k)
-        if seen is not None and now - seen < RETRACE_MEMORY:
-            cost += weight * RETRACE_PENALTY * (1 - (now - seen) / RETRACE_MEMORY)
-    return cost
-
-
 def exploration_goal(mp, my_dist, my_mask, heading, friends, now):
-    """With no pearl to chase, head for the part of the map we have seen least, away from friends.
-    On large maps this also pulls towards the centre, off the border, and away from ground we
-    have just walked over."""
+    """With no pearl to chase, head for the part of the map we have seen least, away from friends."""
     best, best_cost = None, None
     friend_tiles = [(f.get_position().x, f.get_position().y) for f in friends]
-    scanned = 0
     for t, d in my_dist.items():
-        scanned += 1
-        if not scanned & 127 and spent() > HARD_BUDGET_S:
-            break       # out of time: settle for the best goal found so far
         if t not in edges:
             continue
         gain = 0.0
@@ -519,14 +347,10 @@ def exploration_goal(mp, my_dist, my_mask, heading, friends, now):
         if gain < 0.3:
             continue
         cost = d - 3 * gain
-        if my_mask[t] >> heading & 1:
-            cost -= 1     # keep going the way we are facing when it is all the same
-        # every penalty below is >= 0, so a tile that already cannot beat the best is not worth pricing
-        if best_cost is not None and cost >= best_cost:
-            continue
-        cost += edge_cost(t) + retrace_cost(t, now)
         for f in friend_tiles:
             cost += max(0, 6 - wrap_dist(t, f))
+        if my_mask[t] >> heading & 1:
+            cost -= 1     # keep going the way we are facing when it is all the same
         if best_cost is None or cost < best_cost:
             best, best_cost = t, cost
     return best
@@ -688,16 +512,14 @@ def least_bad_move(mp, heading, occupied):
             best, best_cost = i, cost
     return best
 
+
 def execute_turn() -> None:
-    global prev_target, is_queen, is_killer, survived_threats, turn_t0, edge_streak
-    turn_t0 = time.perf_counter()
+    global prev_target, is_queen, is_killer, survived_threats
     now = game.get_round_num()
     head = ct.get_position()
     mp = (head.x, head.y)
-    edge_streak = edge_streak + 1 if border_dist(mp) < BORDER_MARGIN else 0
     heading = DIR_INDEX[ct.get_dir()]
     length = ct.get_length()
-    visit_round[mp] = now
 
     occupied, mine, friends, enemies = observe(now)
     body = update_body(mp, length, mine)
@@ -707,8 +529,8 @@ def execute_turn() -> None:
         survived_threats += 1
 
     if not is_queen:
-        promote_chance = QUEEN_PROMOTE_RATE if now > QUEEN_PROMOTE_START_ROUND else 0.0
-        if random.random() < promote_chance or now > QUEEN_PROMOTE_FINAL_ROUND:
+        promote_chance = min(QUEEN_BASE_RATE + QUEEN_COMBAT_BONUS * survived_threats, 0.9)
+        if random.random() < promote_chance:
             is_queen = True
             is_killer = False
         elif not is_killer and random.random() < KILLER_BASE_RATE:
@@ -746,16 +568,10 @@ def execute_turn() -> None:
     if not allowed and body is not None and len(body) > 1:
         # boxed in: our own tail tip is about to move out of the way
         allowed = [i for i in range(4) if edges[mp][i] == 0 and step(mp, i) == body[-1]]
-    own = set(body) if body is not None else set(hist[-length:])
     if not allowed:
-        through = portal_moves(mp, heading, occupied, enemies, own)
-        if through:
-            # boxed in, but a portal is a way out
-            ct.make_move(DIRS[through[0]])
-            return
-        if ct.can_split(ct.get_length - SPLIT_SIZE): # changed to length - split_size to reverse the direction of the snake
+        if ct.can_split(SPLIT_SIZE):
             # boxed in: shedding the tail frees space and leaves a child that can still get out
-            ct.do_split(ct.get_length - SPLIT_SIZE)
+            ct.do_split(SPLIT_SIZE)
             return
         ct.make_move(DIRS[least_bad_move(mp, heading, occupied)])
         return
@@ -773,10 +589,8 @@ def execute_turn() -> None:
     rivals = rivals[:MAX_RIVALS]
 
     target, rival_d = assign_target(now, my_dist, rivals)
-    exploring = target is None
-    if exploring:
-        # the goal search scans every reachable tile: skip it if the turn is already running long
-        target = exploration_goal(mp, my_dist, my_mask, heading, friends, now) if spent() < SOFT_BUDGET_S else None
+    if target is None:
+        target = exploration_goal(mp, my_dist, my_mask, heading, friends, now)
         rival_d = None
     prev_target = target
     bits = my_mask[target] if target is not None else None
@@ -786,7 +600,7 @@ def execute_turn() -> None:
     check_split_size = SPLIT_SIZE if not is_queen else max(SPLIT_SIZE, length // QUEEN_SPLIT_FRACTION)
     if (target in pearls and body is not None and length >= 2 * check_split_size - 1
             and ct.get_unit_count() < game.get_unit_limit()
-            and (not is_queen or length + 1 >= QUEEN_MIN_SPLIT_LENGTH * now)):
+            and (not is_queen or length + 1 >= QUEEN_MIN_SPLIT_LENGTH)):
         arrive = dir_between(body[-1], body[-2])
         dist_to_target = my_dist.get(target)
         if arrive is not None and dist_to_target and dist_to_target >= 2:
@@ -803,12 +617,6 @@ def execute_turn() -> None:
     in_trouble = (not safe) or (threatened(mp, enemies) and len(safe) <= 1)
 
     if is_queen:
-        # random minimum-size split, whenever a split is legal at all (until the cut-off round)
-        if (now <= QUEEN_RANDOM_SPLIT_LAST_ROUND and ct.can_split(SPLIT_SIZE)
-                and random.random() < QUEEN_RANDOM_SPLIT_RATE):
-            ct.do_split(SPLIT_SIZE)
-            return
-
         queen_split_size = max(SPLIT_SIZE, length // QUEEN_SPLIT_FRACTION)
 
         if is_small_map:
@@ -821,7 +629,7 @@ def execute_turn() -> None:
             # large map, early phase: normal queen splitting behaviour
             can_split = (
                 can_split_basic
-                and length >= QUEEN_MIN_SPLIT_LENGTH * now
+                and length >= QUEEN_MIN_SPLIT_LENGTH
                 and ct.can_split(queen_split_size)
             )
             split_ok = can_split and split_ready(body, heading) and child_has_exit(body, occupied)
@@ -852,14 +660,6 @@ def execute_turn() -> None:
                 ct.do_split(SPLIT_SIZE)
                 return
 
-    # ---- a portal beats open water, but not a pearl right in front of us
-    through = portal_moves(mp, heading, occupied, enemies, own)
-    if through and not any(step(mp, i) in pearls for i in allowed):
-        if DEBUG:
-            ct.output_log("portal", DIRS[through[0]].value, "lands", portal_exit(mp, through[0]))
-        ct.make_move(DIRS[through[0]])
-        return
-
     # ---- pick among the equally short moves, never into a pocket we could not get out of
     want_split = ct.get_unit_count() < game.get_unit_limit()
     my_id = ct.get_id()
@@ -868,11 +668,7 @@ def execute_turn() -> None:
     if body is None:
         others_block |= set(mine) | {mp}   # unknown body: treat what we can see of it as solid
     need = min(length, 30)
-    if spent() > HARD_BUDGET_S:
-        room = {i: need for i in allowed}       # no time to check for pockets: trust the plain move filters
-    else:
-        patience = 500 if spent() < SOFT_BUDGET_S else 60
-        room = {i: escape_depth(step(mp, i), trail, others_block, need, patience) for i in allowed}
+    room = {i: escape_depth(step(mp, i), trail, others_block, need) for i in allowed}
     pool = [i for i in allowed if room[i] >= need]
     if not pool:
         pool = [i for i in allowed if room[i] == max(room.values())]
@@ -903,7 +699,7 @@ def execute_turn() -> None:
     # pearls decide between the safe moves ...
     options = [i for i in pool if bits is None or bits >> i & 1] or pool
     # ... unless a non-queen split is legal and only needs lining up, in which case that comes first
-    if not is_queen and can_split_basic and ct.can_split(SPLIT_SIZE) and spent() < SOFT_BUDGET_S:
+    if not is_queen and can_split_basic and ct.can_split(SPLIT_SIZE):
         steer, _ = steer_to_split(body, pool, others_block)
         options = [i for i in pool if steer >> i & 1] or options
 
@@ -914,9 +710,7 @@ def execute_turn() -> None:
         if want_split and body is not None and not is_queen:
             after = ([nb] + body) if nb in pearls else ([nb] + body[:-1])
             aligned_next = split_ready(after, i)
-        # while exploring, prefer stepping onto ground we have not just walked
-        fresh = not (exploring and walked_recently(nb, now))
-        return (min(exits_from(nb)[1], 2), toward_target, fresh, aligned_next, i == heading, random.random())
+        return (min(exits_from(nb)[1], 2), toward_target, aligned_next, i == heading, random.random())
 
     move = max(options, key=rank)
     if DEBUG:
@@ -945,7 +739,7 @@ def main() -> None:
     W, H = game.get_map_size()
     is_small_map = W <= SMALL_MAP_THRESHOLD or H <= SMALL_MAP_THRESHOLD
     random.seed(ct.get_id())
-    is_queen = ct.get_id() == 0 or ct.get_id() == 1
+    is_queen = ct.get_id() == 0
     is_killer = False
 
     while unswbc.update(ct, game):
